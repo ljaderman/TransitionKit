@@ -1,6 +1,6 @@
 PODS:
   - Kiwi (2.3.1)
-  - TransitionKit (2.2.1)
+  - TransitionKit (3.0.0)
 
 DEPENDENCIES:
   - Kiwi (~> 2.3.0)
