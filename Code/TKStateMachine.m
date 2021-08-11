@@ -41,7 +41,6 @@ NSString *const TKStateMachineDidChangeStateNotification = @"TKStateMachineDidCh
 NSString *const TKStateMachineDidChangeStateOldStateUserInfoKey = @"old";
 NSString *const TKStateMachineDidChangeStateNewStateUserInfoKey = @"new";
 NSString *const TKStateMachineDidChangeStateEventUserInfoKey = @"event";
-NSString *const TKStateMachineDidChangeStateTransitionUserInfoKey = @"transition";
 
 NSString *const TKStateMachineIsImmutableException = @"TKStateMachineIsImmutableException";
 
@@ -58,7 +57,6 @@ static NSString *TKQuoteString(NSString *string)
 @property (nonatomic, strong) NSMutableSet *mutableEvents;
 @property (nonatomic, assign, getter = isActive) BOOL active;
 @property (nonatomic, strong, readwrite) TKState *currentState;
-@property (nonatomic, strong) NSRecursiveLock *lock;
 @end
 
 @implementation TKStateMachine
@@ -86,23 +84,67 @@ static NSString *TKQuoteString(NSString *string)
     if (self) {
         self.mutableStates = [NSMutableSet set];
         self.mutableEvents = [NSMutableSet set];
-        self.lock = [NSRecursiveLock new];
     }
     return self;
+}
+
+// ljad
+// DESCRIPTION: output state machine connections in graphviz markup format
+// RETURNS:     graphviz text markup file as (NSString *) {on autorelease pool}
+-(NSString *)ljad_dumpGraphvizFile {
+    NSMutableString * retStr = [NSMutableString string];
+    
+    ////////////////////////////////////////////////////
+    // add states
+    ////////////////////////////////////////////////////
+    [retStr appendString:@"digraph G {\n   ///////////////////////////////// \n   // STATES \n   ///////////////////////////////// \n   label = iPeriod_FSM; \n   labelloc  =  t; \n   fontsize  = 30; \n   fontcolor = blue \n"];
+    for(TKState * s in self.mutableStates) {
+        [retStr appendFormat:@"   %@;\n", s.name];
+    }
+    [retStr appendString:@"\n"];
+    
+    ////////////////////////////////////////////////////
+    // add events
+    ////////////////////////////////////////////////////
+    [retStr appendString:@"   ///////////////////////////////// \n   // EVENTS \n   ///////////////////////////////// \n"];
+    
+    // initial
+    [retStr appendString:@"   start [shape=Mdiamond,color=blue];\n"];
+    if(self.initialState != nil) {
+        [retStr appendFormat:@"   start -> %@;\n\n", self.initialState.name];
+    }
+
+    // remaining events
+    for(TKEvent * e in self.mutableEvents) {
+        for(TKState * ss in e.sourceStates) {
+            [retStr appendFormat:@"   %@ -> %@ [label=\"   %@   \" ];\n", ss.name, e.destinationState.name, e.name];
+        }
+    }
+    
+    // finish up
+    [retStr appendString:@"\n}\n"];
+    return retStr;
+}
+
+- (NSString *)description
+{
+    return [NSString stringWithFormat:@"<%@:%p %ld States, %ld Events. currentState=%@, initialState='%@', isActive=%@>",
+            NSStringFromClass([self class]), self, (unsigned long) [self.mutableStates count], (unsigned long) [self.mutableEvents count],
+            TKQuoteString(self.currentState.name), self.initialState.name, self.isActive ? @"YES" : @"NO"];
+}
+
+
+- (void)OVERRIDECurrentState:(id)stateOrStateName {
+    if (! [stateOrStateName isKindOfClass:[TKState class]] && ![stateOrStateName isKindOfClass:[NSString class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKState` object or `NSString` object specifying the name of a state, instead got a `%@` (%@)", [stateOrStateName class], stateOrStateName];
+    TKState *state = [stateOrStateName isKindOfClass:[TKState class]] ? stateOrStateName : [self stateNamed:stateOrStateName];
+    if (! state) [NSException raise:NSInvalidArgumentException format:@"Cannot find a State named '%@'", stateOrStateName];
+    self.currentState = state;
 }
 
 - (void)setInitialState:(TKState *)initialState
 {
     TKRaiseIfActive();
     _initialState = initialState;
-}
-
-- (void)setCurrentState:(TKState *)currentState
-{
-    if (currentState == nil) {
-        [NSException raise:NSInvalidArgumentException format:@"Cannot assign currentState to `nil`: Expected a `TKState` object. (%@)", self];
-    }
-    _currentState = currentState;
 }
 
 - (NSSet *)states
@@ -113,9 +155,7 @@ static NSString *TKQuoteString(NSString *string)
 - (void)addState:(TKState *)state
 {
     TKRaiseIfActive();
-    if (! [state isKindOfClass:[TKState class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKState` object, instead got a `%@` (%@)", [state class], state];
-    if ([self stateNamed: state.name]) [NSException raise:NSInvalidArgumentException format:@"State with name `%@` already exists", state.name];
-
+    if (! [state isKindOfClass:[TKState class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKState` object or `NSString` object specifying the name of a state, instead got a `%@` (%@)", [state class], state];
     if (self.initialState == nil) self.initialState = state;
     [self.mutableStates addObject:state];
 }
@@ -183,14 +223,12 @@ static NSString *TKQuoteString(NSString *string)
 - (void)activate
 {
     if (self.isActive) [NSException raise:NSInternalInconsistencyException format:@"The state machine has already been activated."];
-    [self.lock lock];
     self.active = YES;
     
     // Dispatch callbacks to establish initial state
     if (self.initialState.willEnterStateBlock) self.initialState.willEnterStateBlock(self.initialState, nil);
     self.currentState = self.initialState;
     if (self.initialState.didEnterStateBlock) self.initialState.didEnterStateBlock(self.initialState, nil);
-    [self.lock unlock];
 }
 
 - (BOOL)canFireEvent:(id)eventOrEventName
@@ -198,63 +236,77 @@ static NSString *TKQuoteString(NSString *string)
     if (! [eventOrEventName isKindOfClass:[TKEvent class]] && ![eventOrEventName isKindOfClass:[NSString class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKEvent` object or `NSString` object specifying the name of an event, instead got a `%@` (%@)", [eventOrEventName class], eventOrEventName];
     TKEvent *event = [eventOrEventName isKindOfClass:[TKEvent class]] ? eventOrEventName : [self eventNamed:eventOrEventName];
     if (! event) [NSException raise:NSInvalidArgumentException format:@"Cannot find an Event named '%@'", eventOrEventName];
-    return event.sourceStates == nil || [event.sourceStates containsObject:self.currentState];
+    return [event.sourceStates containsObject:self.currentState];
 }
 
 - (BOOL)fireEvent:(id)eventOrEventName userInfo:(NSDictionary *)userInfo error:(NSError *__autoreleasing *)error
 {
-    [self.lock lock];
-    if (! self.isActive) [self activate];
-    if (! [eventOrEventName isKindOfClass:[TKEvent class]] && ![eventOrEventName isKindOfClass:[NSString class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKEvent` object or `NSString` object specifying the name of an event, instead got a `%@` (%@)", [eventOrEventName class], eventOrEventName];
-    TKEvent *event = [eventOrEventName isKindOfClass:[TKEvent class]] ? eventOrEventName : [self eventNamed:eventOrEventName];
-    if (! event) [NSException raise:NSInvalidArgumentException format:@"Cannot find an Event named '%@'", eventOrEventName];
-
-    // Check that this transition is permitted
-    if (event.sourceStates != nil && ![event.sourceStates containsObject:self.currentState]) {
-        NSString *failureReason = [NSString stringWithFormat:@"An attempt was made to fire the '%@' event while in the '%@' state, but the event can only be fired from the following states: %@", event.name, self.currentState.name, [[event.sourceStates valueForKey:@"name"] componentsJoinedByString:@", "]];
-        NSDictionary *userInfo = @{ NSLocalizedDescriptionKey: @"The event cannot be fired from the current state.", NSLocalizedFailureReasonErrorKey: failureReason };
-        if (error) *error = [NSError errorWithDomain:TKErrorDomain code:TKInvalidTransitionError userInfo:userInfo];
-        [self.lock unlock];
-        return NO;
-    }
-
-    TKTransition *transition = [TKTransition transitionForEvent:event fromState:self.currentState inStateMachine:self userInfo:userInfo];
-    if (event.shouldFireEventBlock) {
-        if (! event.shouldFireEventBlock(event, transition)) {
-            NSString *failureReason = [NSString stringWithFormat:@"An attempt to fire the '%@' event was declined because `shouldFireEventBlock` returned `NO`.", event.name];
-            NSDictionary *userInfo = @{ NSLocalizedDescriptionKey: @"The event declined to be fired.", NSLocalizedFailureReasonErrorKey: failureReason };
-            if (error) *error = [NSError errorWithDomain:TKErrorDomain code:TKTransitionDeclinedError userInfo:userInfo];
-            [self.lock unlock];
+    @synchronized (self) {
+        if (! self.isActive) [self activate];
+        if (! [eventOrEventName isKindOfClass:[TKEvent class]] && ![eventOrEventName isKindOfClass:[NSString class]]) [NSException raise:NSInvalidArgumentException format:@"Expected a `TKEvent` object or `NSString` object specifying the name of an event, instead got a `%@` (%@)", [eventOrEventName class], eventOrEventName];
+        TKEvent *event = [eventOrEventName isKindOfClass:[TKEvent class]] ? eventOrEventName : [self eventNamed:eventOrEventName];
+        if (! event) [NSException raise:NSInvalidArgumentException format:@"Cannot find an Event named '%@'", eventOrEventName];
+        
+        // Check that this transition is permitted
+        if (event.sourceStates != nil && ![event.sourceStates containsObject:self.currentState]) {
+            NSString *failureReason = [NSString stringWithFormat:@"An attempt was made to fire the '%@' event while in the '%@' state, but the event can only be fired from the following states: %@", event.name, self.currentState.name, [[event.sourceStates valueForKey:@"name"] componentsJoinedByString:@", "]];
+            NSDictionary *userInfo = @{ NSLocalizedDescriptionKey: @"The event cannot be fired from the current state.", NSLocalizedFailureReasonErrorKey: failureReason };
+            if (error) *error = [NSError errorWithDomain:TKErrorDomain code:TKInvalidTransitionError userInfo:userInfo];
             return NO;
         }
+        
+        TKTransition *transition = [TKTransition transitionForEvent:event fromState:self.currentState inStateMachine:self userInfo:userInfo];
+        if (event.shouldFireEventBlock) {
+            if (! event.shouldFireEventBlock(event, transition)) {
+                NSString *failureReason = [NSString stringWithFormat:@"An attempt to fire the '%@' event was declined because `shouldFireEventBlock` returned `NO`.", event.name];
+                NSDictionary *userInfo = @{ NSLocalizedDescriptionKey: @"The event declined to be fired.", NSLocalizedFailureReasonErrorKey: failureReason };
+                if (error) *error = [NSError errorWithDomain:TKErrorDomain code:TKTransitionDeclinedError userInfo:userInfo];
+                return NO;
+            }
+        }
+        
+        // ljad - log caller of statemachine event call
+        //    NSLog(@"Stack = %@", [array objectAtIndex:0]);
+        //    NSLog(@"Framework = %@", [array objectAtIndex:1]);
+        //    NSLog(@"Memory address = %@", [array objectAtIndex:2]);
+        //    NSLog(@"Class caller = %@", [array objectAtIndex:4]);
+        //    NSLog(@"Function caller = %@", [array objectAtIndex:5]);
+        NSString *sourceString = [[NSThread callStackSymbols] objectAtIndex:1];
+        NSCharacterSet *separatorSet = [NSCharacterSet characterSetWithCharactersInString:@" -[]+?.,"];
+        NSMutableArray *array = [NSMutableArray arrayWithArray:[sourceString  componentsSeparatedByCharactersInSet:separatorSet]];
+        [array removeObject:@""];
+        NSString * callerInfo = @"";
+        if([array count] > 5) {
+            // if the call stack string is formatted how we expect...
+            callerInfo = [NSString stringWithFormat:@"%@::%@", [array objectAtIndex:4], [array objectAtIndex:5]];
+        } else {
+            // otherwise just pass entire stack slice
+            callerInfo = sourceString;
+        }
+        
+        TKState *oldState = self.currentState;
+        TKState *newState = event.destinationState;
+        
+        if (event.willFireEventBlock) event.willFireEventBlock(event, transition);
+        
+        if (oldState.willExitStateBlock) oldState.willExitStateBlock(oldState, transition);
+        if (newState.willEnterStateBlock) newState.willEnterStateBlock(newState, transition);
+        self.currentState = newState;
+        if (oldState.didExitStateBlock) oldState.didExitStateBlock(oldState, transition);
+        if (newState.didEnterStateBlock) newState.didEnterStateBlock(newState, transition);
+        
+        if (event.didFireEventBlock) event.didFireEventBlock(event, transition);
+        
+        NSMutableDictionary *notificationInfo = [userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
+        [notificationInfo addEntriesFromDictionary:@{ TKStateMachineDidChangeStateOldStateUserInfoKey: oldState,
+                                                      TKStateMachineDidChangeStateNewStateUserInfoKey: newState,
+                                                      TKStateMachineDidChangeStateEventUserInfoKey: event,
+                                                      @"CALLER_INFO": callerInfo
+        }];
+        [[NSNotificationCenter defaultCenter] postNotificationName:TKStateMachineDidChangeStateNotification object:self userInfo:notificationInfo];
+        
+        return YES;
     }
-
-    TKState *oldState = self.currentState;
-    TKState *newState = event.destinationState;
-    
-    if (event.willFireEventBlock) event.willFireEventBlock(event, transition);
-    
-    if (oldState.willExitStateBlock) oldState.willExitStateBlock(oldState, transition);
-    if (newState.willEnterStateBlock) newState.willEnterStateBlock(newState, transition);
-    self.currentState = newState;
-    
-    NSMutableDictionary *notificationInfo = [userInfo mutableCopy] ?: [NSMutableDictionary dictionary];
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    [notificationInfo addEntriesFromDictionary:@{ TKStateMachineDidChangeStateOldStateUserInfoKey: oldState,
-                                                  TKStateMachineDidChangeStateNewStateUserInfoKey: newState,
-                                                  TKStateMachineDidChangeStateEventUserInfoKey: event,
-#pragma clang diagnostic pop
-                                                  TKStateMachineDidChangeStateTransitionUserInfoKey: transition }];
-    [[NSNotificationCenter defaultCenter] postNotificationName:TKStateMachineDidChangeStateNotification object:self userInfo:notificationInfo];
-    
-    if (oldState.didExitStateBlock) oldState.didExitStateBlock(oldState, transition);
-    if (newState.didEnterStateBlock) newState.didEnterStateBlock(newState, transition);
-    
-    if (event.didFireEventBlock) event.didFireEventBlock(event, transition);
-    [self.lock unlock];
-    
-    return YES;
 }
 
 #pragma mark - NSCoding
@@ -289,6 +341,7 @@ static NSString *TKQuoteString(NSString *string)
 {
     TKStateMachine *copiedStateMachine = [[[self class] allocWithZone:zone] init];
     copiedStateMachine.active = NO;
+    copiedStateMachine.currentState = nil;
     copiedStateMachine.initialState = self.initialState;
     
     for (TKState *state in self.states) {
@@ -305,33 +358,6 @@ static NSString *TKQuoteString(NSString *string)
         [copiedStateMachine addEvent:copiedEvent];
     }
     return copiedStateMachine;
-}
-
-#pragma mark - Description
-
-- (NSString *)description
-{
-    return [NSString stringWithFormat:@"<%@:%p %ld States, %ld Events. currentState=%@, initialState='%@', isActive=%@>",
-            NSStringFromClass([self class]), self, (unsigned long) [self.mutableStates count], (unsigned long) [self.mutableEvents count],
-            TKQuoteString(self.currentState.name), self.initialState.name, self.isActive ? @"YES" : @"NO"];
-}
-
-- (NSString *)dotDescription
-{
-    NSMutableString *dotDescription = [[NSMutableString alloc] initWithString:@"digraph StateMachine {\n"];
-    if (self.initialState) {
-        [dotDescription appendFormat:@"  \"\" [style=\"invis\"]; \"\" -> \"%@\" [dir=both, arrowtail=dot]; // Initial State\n", self.initialState.name];
-    }
-    if (self.currentState) {
-        [dotDescription appendFormat:@"  \"%@\" [style=bold]; // Current State\n", self.currentState.name];
-    }
-    for (TKEvent *event in self.events) {
-        for (TKState *sourceState in event.sourceStates) {
-            [dotDescription appendFormat:@"  \"%@\" -> \"%@\" [label=\"%@\", fontname=\"Menlo Italic\", fontsize=9];\n", sourceState.name, event.destinationState.name, event.name];
-        }
-    }
-    [dotDescription appendString:@"}"];
-    return [dotDescription copy];
 }
 
 @end
